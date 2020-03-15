@@ -7,6 +7,10 @@ namespace torch {
 namespace distributed {
 namespace rpc {
 
+thread_local std::vector<std::shared_ptr<RRefContext::PendingUserState>>
+    RRefContext::userTable_;
+thread_local bool RRefContext::recording = false;
+
 namespace callback {
 void confirmPendingUser(
     const rpc::Message& message,
@@ -256,6 +260,7 @@ c10::intrusive_ptr<OwnerRRef> RRefContext::getOrCreateOwnerRRef(
     const RRefId& rrefId,
     const TypePtr& type) {
   std::lock_guard<std::mutex> lock(mutex_);
+
   const auto iter = owners_.find(rrefId);
   if (iter == owners_.end()) {
     // Scenario (1) the first time this owner knows about this RRef
@@ -287,6 +292,7 @@ c10::intrusive_ptr<OwnerRRef> RRefContext::createOwnerRRef(
 
 c10::intrusive_ptr<OwnerRRef> RRefContext::getOwnerRRef(const RRefId& rrefId) {
   std::unique_lock<std::mutex> lock(mutex_);
+
   const auto iter = owners_.find(rrefId);
   if (iter == owners_.end()) {
     // Scenario (1) RRef is used before it is created
@@ -438,38 +444,99 @@ void RRefContext::addPendingUser(
     const c10::intrusive_ptr<RRef>& rref) {
   TORCH_INTERNAL_ASSERT(
       !rref->isOwner(), "Attempt to add an OwnerRRef as a pending User.");
+
+  auto state = std::make_shared<PendingUserState>(rref);
+  if (recording) {
+    // adding and waiting for pending users are guaranteed to be called from the
+    // same thread, but deleting pending users will be called from another
+    // thread. As the delPendingUser will not be able to access the same
+    // thread_local variable, we cannot address this problem by making
+    // pendingUsers_ thread_local. Instead, pendingUsers_ and userTable_ share
+    // the same PendingUserState shared_ptr.
+    userTable_.push_back(state);
+  }
+
   std::lock_guard<std::mutex> lock(mutex_);
   TORCH_INTERNAL_ASSERT(
       pendingUsers_.find(forkId) == pendingUsers_.end(),
       "Inconsistent states: attempt to add the same UserRRef twice.");
-  pendingUsers_[forkId] = rref;
+
+  pendingUsers_.emplace(
+      std::piecewise_construct,
+      std::forward_as_tuple(forkId),
+      std::forward_as_tuple(state));
 }
 
 void RRefContext::delPendingUser(const ForkId& forkId) {
-  c10::intrusive_ptr<RRef> deletedUser;
+  std::shared_ptr<PendingUserState> deletedState = nullptr;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto iter = pendingUsers_.find(forkId);
     TORCH_INTERNAL_ASSERT(
         iter != pendingUsers_.end(),
         "Inconsistent states: attempt to delete a non-exist UserRRef.");
+
+    // There are two reasons for keeping the deleted PendingUserState alive
+    // until exiting the critical section.
+    // (1) Since this UserRRef is removed from the map, the refcount of this
+    //     UserRRef could reach to 0. So the resource destructor
+    //     (`release_resources()`) might be called, in which the lock is
+    //     acquired again. Hence, it must be destructed with the lock released.
+    //     To meet this constraint, we intentionally create a temporary pointer
+    //     to increase the refcount of the deleted PendingUserState, extending
+    //     its lifetime untill lock released.
+    // (2) Since #34497, a user function only runs after all RRefs in the
+    //     arguments are confirmed by their owners, which is done by adding the
+    //     RPC processing logic as a callback to the UserRRef ready future. So,
+    //     calling `confirm` on the PendingUserState could trigger pending user
+    //     functions, which might in turn acquire the lock in RRefContext.
+    //     Hence, we must release the lock to prevent deadlock.
+    // NB: Another option is to use reentrant lock. However, it is better for
+    // the developers to fully understand the locking behavior instead of
+    // hiding the subtle logic using a reentrant lock.
+    deletedState = iter->second; // Increase refcount
+
     confirmedUsers_.emplace(
         std::piecewise_construct,
         std::forward_as_tuple(forkId),
-        std::forward_as_tuple(iter->second));
-
-    // Since this UserRRef is removed from the map,
-    // the refcount of this UserRRef could reach to 0,
-    // so the "destructor", `release_resources()`, might be called,
-    // in which the lock is acquired again.
-    // So it must be destructed with the lock released.
-    // Meet this constraint by creating a temporary pointer to increase the
-    // refcount, extending its lifetime untill lock released.
-    deletedUser = iter->second; // Increase refcount.
+        std::forward_as_tuple(iter->second->rref_));
     pendingUsers_.erase(iter); // Decrease refcount.
   }
+  deletedState->confirm();
   deleteAllUsersCV_.notify_all();
-  deletedUser.reset(); // Decrease refcount.
+  deletedState.reset(); // Decrease refcount.
+}
+
+void RRefContext::recordThreadLocalPendingRRefs() {
+  TORCH_INTERNAL_ASSERT(
+      userTable_.empty(),
+      "User RRef Table should be empty when start recording");
+  recording = true;
+}
+
+std::shared_ptr<torch::utils::Future<bool>> RRefContext::
+    waitForThreadLocalPendingRRefs() {
+  auto future = std::make_shared<torch::utils::Future<bool>>();
+  if (userTable_.empty()) {
+    future->markCompleted(true);
+  } else {
+    auto remainingRRefs =
+        std::make_shared<std::atomic<uint64_t>>(userTable_.size());
+    for (auto& state : userTable_) {
+      state->future_.addCallback(
+          [future, remainingRRefs](
+              const bool& /* unused */,
+              const c10::optional<utils::FutureError>& /* unused */) {
+            auto localCount = remainingRRefs->fetch_sub(1);
+            if (localCount == 1) {
+              future->markCompleted(true);
+            }
+          });
+    }
+    userTable_.clear();
+  }
+  recording = false;
+  return future;
 }
 
 void RRefContext::finishForkRequest(const ForkId& forkId, worker_id_t parent) {
