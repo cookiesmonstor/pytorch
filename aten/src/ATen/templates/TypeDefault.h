@@ -10,9 +10,11 @@
 #include <c10/util/intrusive_ptr.h>
 #include <torch/csrc/WindowsTorchApiMacro.h>
 #include <ATen/Dimname.h>
+#include <c10/core/GeneratorImpl.h>
 
 namespace c10 {
 struct Storage;
+struct GeneratorImpl;
 }
 
 namespace at {

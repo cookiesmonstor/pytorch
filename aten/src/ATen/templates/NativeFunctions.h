@@ -6,6 +6,7 @@
 #include <c10/core/ScalarType.h>
 #include <c10/core/TensorOptions.h>
 #include <ATen/core/Reduction.h>
+#include <c10/core/GeneratorImpl.h>
 
 #include <array>
 #include <functional>
@@ -15,6 +16,7 @@
 
 namespace c10 {
 class Scalar;
+struct GeneratorImpl;
 }
 namespace at {
 struct Generator;
