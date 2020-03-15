@@ -77,9 +77,9 @@ struct Generator {
 
   operator bool() const { return (bool)impl; }
 
-  c10::GeneratorImpl* operator->() { return impl.get(); }
+  // c10::GeneratorImpl* operator->() { return impl.get(); }
 
-  const c10::GeneratorImpl* operator->() const { return impl.get(); }
+  c10::GeneratorImpl* operator->() const { return impl.get(); }
 
   c10::GeneratorImpl* get() { return impl.get(); }
 
@@ -96,4 +96,3 @@ Generator make_generator(Args&&... args) {
 }
 
 } // namespace at
-
